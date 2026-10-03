@@ -509,6 +509,14 @@ let sendDocumentState params =
   let Request.Client.DocumentStateParams.{ textDocument } = params in
   let uri = textDocument.uri in
   let@ { st } = with_document_request "documentState" uri in
+  let max_delay = 30.0 in
+  let delay_multiplier = 2.0 in
+  let rec poll delay =
+    if Dm.DocumentManager.is_parsing st then
+      (Unix.sleepf delay;
+      poll (min (delay *. delay_multiplier) max_delay));
+  in
+  poll 0.05;
   let document = Dm.DocumentManager.Internal.string_of_state st in
   Ok Request.Client.DocumentStateResult.{ document }, []
 
