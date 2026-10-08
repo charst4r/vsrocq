@@ -43,7 +43,7 @@ val init : Vernacstate.t -> opts:Coqargs.injection_command list -> DocumentUri.t
     [st] on which command line opts will be set. *)
 
 val apply_text_edits : state -> text_edit list -> state * events
-(** [apply_text_edits doc edits] updates the text of [doc] with [edits]. 
+(** [apply_text_edits doc edits] updates the text of [doc] with [edits].
     A ParseEvent is triggered, once processed: the new
     document is parsed, outdated executions states are invalidated, and the observe
     id is updated. *)
@@ -61,7 +61,7 @@ val get_current_line_range : state -> Position.t -> Range.t
 (** [get_current_line_range st pos] get the range of the current line starting from the first non-whitespace character and ending at `pos` *)
 
 val interpret_to_position : Position.t -> events
-(** [interpret_to_position pos] navigates to the 
+(** [interpret_to_position pos] navigates to the
     last sentence ending before or at [pos] and returns the resulting state, events that need to take place, and a possible blocking error. *)
 
 val interpret_to_previous : unit -> events
@@ -77,10 +77,10 @@ val interpret_to_end : unit -> events
     and returns the resulting state. *)
 
 val interpret_in_background : state -> (state * events)
-(** [interpret_in_background doc] same as [interpret_to_end] but computation 
+(** [interpret_in_background doc] same as [interpret_to_end] but computation
     is done in background (with lower priority) *)
 
-val reset : state -> state * events 
+val reset : state -> state * events
 (** resets Rocq *)
 
 val interrupt_execution : state -> unit
@@ -109,11 +109,13 @@ val get_selection_range : state -> Position.t -> SelectionRange.t
 
 val get_document_proofs : state -> ProofState.proof_block list
 
+val get_document_state : Jsonrpc.Id.t -> DocumentUri.t -> (Jsonrpc.Id.t -> Yojson.Safe.t -> unit) -> event Sel.Event.t
+
 val all_diagnostics : state -> Diagnostic.t list
 (** all_diagnostics [doc] returns the diagnostics corresponding to the sentences
     that have been executed in [doc]. *)
 
-val get_completions : state -> Position.t -> completion_item list 
+val get_completions : state -> Position.t -> completion_item list
 
 val handle_event : event -> state -> (state,event) handled_event
 (** handles events and returns a new state if it was updated. On top of the next events, it also returns info

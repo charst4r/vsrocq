@@ -114,6 +114,9 @@ let inject_notifications l =
 let inject_debug_events l =
   List.map inject_debug_event l
 
+(* adhoc but works for now *)
+let delayed_request_ids : (Jsonrpc.Id.t, unit) Hashtbl.t = Hashtbl.create 16
+
 let do_configuration settings =
   let open Settings in
   let open Dm.ExecutionManager in
@@ -505,12 +508,16 @@ let rocqtopSearch params =
     let message = Pp.string_of_ppcmds @@ CErrors.iprint (e, info) in
     Error({message; code=None}), []
 
-let sendDocumentState params =
+let sendDocumentState id params =
   let Request.Client.DocumentStateParams.{ textDocument } = params in
   let uri = textDocument.uri in
   let@ { st } = with_document_request "documentState" uri in
-  let document = Dm.DocumentManager.Internal.string_of_state st in
-  Ok Request.Client.DocumentStateResult.{ document }, []
+  Hashtbl.replace delayed_request_ids id ();
+  let event =
+    Dm.DocumentManager.get_document_state id uri (fun id json -> output_json @@ Jsonrpc.Response.(yojson_of_t @@ ok id json))
+  in
+  Ok Request.Client.DocumentStateResult.{ document = "" },
+  (uri, [event]) |> inject_dm_events
 
 let sendDocumentProofs params =
   let Request.Client.DocumentProofsParams.{ textDocument } = params in
@@ -548,7 +555,8 @@ let dispatch_std_request : type a. a Lsp.Client_request.t -> (a, error) result *
   | SelectionRange params -> documentSelectionRanges params, []
   | UnknownRequest _ | _  -> Error ({message="Received unknown request"; code=None}), []
 
-let dispatch_request : type a. a Request.Client.t -> (a,error) result * events = function
+let dispatch_request : type a. Jsonrpc.Id.t -> a Request.Client.t -> (a, error) result * events =
+  fun id req -> match req with
   | Std req -> dispatch_std_request req
   | Reset params -> rocqtopResetRocq params
   | About params -> rocqtopAbout params
@@ -556,7 +564,7 @@ let dispatch_request : type a. a Request.Client.t -> (a,error) result * events =
   | Locate params -> rocqtopLocate params
   | Print params -> rocqtopPrint params
   | Search params -> rocqtopSearch params
-  | DocumentState params -> sendDocumentState params
+  | DocumentState params -> sendDocumentState id params
   | DocumentProofs params -> sendDocumentProofs params
 
 let dispatch_std_notification =
@@ -600,14 +608,17 @@ let handle_lsp_event = function
           begin match Request.Client.t_of_jsonrpc req with
           | Error(e) -> log (fun () -> "Error decoding request: " ^ e); []
           | Ok(Pack r) ->
-            let resp, events = dispatch_request r in
+            let resp, events = dispatch_request req.id r in
             begin match resp with
             | Error {code; message} ->
               let code = Option.default Jsonrpc.Response.Error.Code.RequestFailed code in
               output_json @@ Jsonrpc.Response.(yojson_of_t @@ error req.id (Error.make ~code ~message ()))
             | Ok resp ->
-              let resp = Request.Client.yojson_of_result r resp in
-              output_json @@ Jsonrpc.Response.(yojson_of_t @@ ok req.id resp)
+              if Hashtbl.mem delayed_request_ids req.id then
+                Hashtbl.remove delayed_request_ids req.id
+              else
+                let resp = Request.Client.yojson_of_result r resp in
+                output_json @@ Jsonrpc.Response.(yojson_of_t @@ ok req.id resp)
             end;
             events
           end

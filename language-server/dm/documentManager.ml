@@ -16,6 +16,7 @@
 
 open Lsp.Types
 open Protocol.LspWrapper
+open Protocol.ExtProtocol
 open Protocol.Printing
 open Types
 
@@ -48,12 +49,18 @@ type event =
   | DocumentEvent of Document.event
   | InteractionManagerEvent of CheckingManager.event
   | LocalFeedback of feedback_data list
+  | DocumentStateEvent of {
+      id : Jsonrpc.Id.t;
+      uri : DocumentUri.t;
+      send_callback : Jsonrpc.Id.t -> Yojson.Safe.t -> unit;
+    }
 
 let pp_event fmt = function
   | ParseBegin -> Stdlib.Format.fprintf fmt "ParseBegin"
   | DocumentEvent event -> Stdlib.Format.fprintf fmt "DocumentEvent event: "; Document.pp_event fmt event
   | InteractionManagerEvent event -> Stdlib.Format.fprintf fmt "InteractionManagerEvent event: "; CheckingManager.pp_event fmt event
   | LocalFeedback _ -> Stdlib.Format.fprintf fmt "LocalFeedback"
+  | DocumentStateEvent _ -> Stdlib.Format.fprintf fmt "DocumentStateEvent"
 
 let inject_im_event x = Sel.Event.map (fun e -> InteractionManagerEvent e) x
 let inject_im_events events = List.map inject_im_event events
@@ -63,7 +70,10 @@ let inject_doc_events events = List.map inject_doc_event events
 
 let mk_parsing_begin_event () =
   Sel.now ~undup:(=) ~priority:PriorityManager.launch_parsing ParseBegin
-  
+
+let mk_document_state_event ~id ~uri ~send_callback : event Sel.Event.t =
+  Sel.now ~priority:PriorityManager.interp_to (DocumentStateEvent { id; uri; send_callback })
+
 type events = event Sel.Event.t list
 
 let is_parsing st =  st.document_state = Parsing
@@ -88,7 +98,7 @@ let make_diagnostic doc range oloc message severity code =
   Diagnostic.create ?code ?data ~range ~message:(message_of_string message) ~severity ()
 
 let mk_diag st (id,(lvl,oloc,qf,msg)) =
-  let code = 
+  let code =
     match qf with
     | [] -> None
     | qf ->
@@ -109,7 +119,7 @@ let mk_diag st (id,(lvl,oloc,qf,msg)) =
     make_diagnostic st.document (Document.range_of_id st.document id) oloc (Pp.string_of_ppcmds msg) lvl code
 
 let mk_error_diag st (id,(oloc,msg,qf)) = (* mk_diag st (id,(Feedback.Error,oloc, msg)) *)
-  let code = 
+  let code =
     match qf with
     | None -> None
     | Some qf ->
@@ -136,7 +146,7 @@ let mk_parsing_error_diag st Document.{ msg = (oloc,msg); start; stop; qf } =
   let start = RawDocument.position_of_loc doc start in
   let end_ = RawDocument.position_of_loc doc stop in
   let range = Range.{ start; end_ } in
-  let code = 
+  let code =
     match qf with
     | None -> None
     | Some qf ->
@@ -161,7 +171,7 @@ let all_diagnostics st =
   let all_feedback = Document.all_feedback st.document in
   (* we are resilient to a state where invalidate was not called yet *)
   let exists (id,_) = Option.has_some (Document.get_sentence st.document id) in
-  let not_info (_, (lvl, _, _, _)) = 
+  let not_info (_, (lvl, _, _, _)) =
     match lvl with
     | Feedback.Info -> false
     | _ -> true
@@ -172,6 +182,29 @@ let all_diagnostics st =
     List.map (mk_error_diag st) exec_errors @
     List.map (mk_diag st) feedback
 
+let is_locally_executed st id =
+  match Document.get_sentence st.document id with
+  | Some { checked = Some (Success (Some _) | Failure (_,_,Some _)) } -> true
+  | _ -> false
+
+let string_of_state st =
+  let code_lines_by_id = Document.code_lines_sorted_by_loc st.document in
+  let code_lines_by_end = Document.code_lines_by_end_sorted_by_loc st.document in
+  let string_of_state id =
+    if is_locally_executed st id then "(executed)"
+    else if CheckingManager.Internal.is_remotely_executed st.checking_state id then "(executed in worker)"
+    else "(not executed)"
+  in
+  let string_of_item item =
+    Document.Internal.string_of_item item ^ " " ^
+      match item with
+      | Sentence { id } -> string_of_state id
+      | ParsingError _ -> "(error)"
+      | Comment _ -> "(comment)"
+  in
+  let string_by_id = String.concat "\n" @@ List.map string_of_item code_lines_by_id in
+  let string_by_end = String.concat "\n" @@ List.map string_of_item code_lines_by_end in
+  String.concat "\n" ["Document using sentences_by_id map\n"; string_by_id; "\nDocument using sentences_by_end map\n"; string_by_end]
 
 let get_info_messages st pos =
   match Option.append
@@ -180,7 +213,7 @@ let get_info_messages st pos =
   with
   | None -> log (fun () -> "get_messages: Could not find id");[]
   | Some id -> log (fun () -> "get_messages: Found id");
-    let info (lvl, _, _, _) = 
+    let info (lvl, _, _, _) =
       match lvl with
       | Feedback.Info -> true
       | _ -> false
@@ -267,14 +300,14 @@ let dirpath_of_top = Coqinit.dirpath_of_top
 
 [%%if rocq ="8.18" || rocq ="8.19"]
 let start_library ~doc_id uri ~opts init_vs =
-  ProverThread.run ~doc_id ~name:"start_library" (fun () -> 
+  ProverThread.run ~doc_id ~name:"start_library" (fun () ->
     Vernacstate.unfreeze_full_state init_vs;
     let top = dirpath_of_top (TopPhysical (DocumentUri.to_path uri)) in
     Coqinit.start_library ~top opts;
     Vernacstate.freeze_full_state ()) |> Result.fold ~ok:(fun x -> x) ~error:(fun x -> CErrors.user_err x)
 [%%else]
 let start_library ~doc_id uri ~opts init_vs =
-  ProverThread.run ~doc_id ~name:"start_library" (fun () -> 
+  ProverThread.run ~doc_id ~name:"start_library" (fun () ->
     Vernacstate.unfreeze_full_state init_vs;
     let top = dirpath_of_top (TopPhysical (DocumentUri.to_path uri)) in
     let intern = Vernacinterp.fs_intern in
@@ -375,6 +408,14 @@ let handle_event ev st =
     let st = { st with document = List.fold_left Document.update_checked st.document updates } in
     lift_handled_event (function None -> Some st | Some checking_state -> Some { st with checking_state })
       inject_im_events he
+  | DocumentStateEvent { id; uri; send_callback } ->
+    if is_parsing st then
+      make_handled_event ~state:st ~update_view:false ~events:[mk_document_state_event ~id ~uri ~send_callback] ()
+    else
+      let document = string_of_state st in
+      (* json should be done in lspmanager but flemme this is jsut an experiment *)
+      send_callback id (Request.Client.DocumentStateResult.yojson_of_t { document });
+      make_handled_event ~state:st ~update_view:false ~events:[] ()
 
 let rocq_state_for st pos =
   let loc = RawDocument.loc_of_position (Document.raw_document st.document) pos in
@@ -417,6 +458,9 @@ let get_completions st pos =
   let vs = rocq_state_for st pos in
   QueryManager.get_completions ~doc_id:(Document.id st.document) ~vs
 
+let get_document_state id uri send_callback : event Sel.Event.t =
+  mk_document_state_event ~id ~uri ~send_callback
+
 (* Ignore nested proofs option (lives in STM) instead of failing with
    anomaly when it is set in a .vo we Require.
    cf #1060 *)
@@ -456,12 +500,12 @@ let reset_to_top st =
   { st with checking_state = CheckingManager.reset_to_top st.checking_state }
 
 module Internal = struct
-          
+
   let document st = st.document
 
   let get_proof st id = CheckingManager.Internal.get_proof st.document st.checking_state id
-          
-  let raw_document st = 
+
+  let raw_document st =
     Document.raw_document st.document
 
   let observe_id st = CheckingManager.get_observe_id st.checking_state
@@ -470,29 +514,8 @@ module Internal = struct
 
   let validate_document st parsing_end_info = validate_document st parsing_end_info
 
-  let is_locally_executed st id =
-    match Document.get_sentence st.document id with
-    | Some { checked = Some (Success (Some _) | Failure (_,_,Some _)) } -> true
-    | _ -> false
-
-  let string_of_state st =
-    let code_lines_by_id = Document.code_lines_sorted_by_loc st.document in
-    let code_lines_by_end = Document.code_lines_by_end_sorted_by_loc st.document in
-    let string_of_state id =
-      if is_locally_executed st id then "(executed)"
-      else if CheckingManager.Internal.is_remotely_executed st.checking_state id then "(executed in worker)"
-      else "(not executed)"
-    in
-    let string_of_item item =
-      Document.Internal.string_of_item item ^ " " ^
-        match item with
-        | Sentence { id } -> string_of_state id
-        | ParsingError _ -> "(error)"
-        | Comment _ -> "(comment)"
-    in
-    let string_by_id = String.concat "\n" @@ List.map string_of_item code_lines_by_id in
-    let string_by_end = String.concat "\n" @@ List.map string_of_item code_lines_by_end in
-    String.concat "\n" ["Document using sentences_by_id map\n"; string_by_id; "\nDocument using sentences_by_end map\n"; string_by_end]
-    let inject_doc_events = inject_doc_events
+  let inject_doc_events = inject_doc_events
+  let is_locally_executed = is_locally_executed
+  let string_of_state = string_of_state
 
 end
