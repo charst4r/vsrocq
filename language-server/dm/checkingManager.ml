@@ -600,6 +600,12 @@ let get_string_proof document st id =
   let ost = Option.bind oid (vernac_state_of_sentence document) in
   Option.bind ost PpProofState.get_proof
 
+let get_structured_proof document st id =
+  let observe_id = get_observe_id st in
+  let oid = Option.append id observe_id in
+  let ost = Option.bind oid (vernac_state_of_sentence document) in
+  Option.bind ost StructuredProofState.get_proof
+
 let get_messages document id =
   let error = Document.error document id in
   let feedback = Document.feedback document id in
@@ -631,24 +637,27 @@ let handle_event ~uri document st ev =
       let state, events = observe document st id ~block_on_first_error ~background in
       ([], make_handled_event ~state ~update_view:true ~events ())
   | SendProofView (Some id) when Document.has_sentence document id ->
-      let proof, pp_proof =
+      let proof, pp_proof, struct_proof =
         ProverThread.try_run ~doc_id:st.doc_id ~name:"SendProofView" ~timeout:1.0 (fun () ->
           match pp_mode with
-          | Pp -> (get_proof document st (Some id), None)
-          | String -> (None, get_string_proof document st (Some id)))
-        |> function Terminated(a,b) -> a,b | _ -> None,None
+          | Pp -> (get_proof document st (Some id), None, None)
+          | String -> (None, get_string_proof document st (Some id), None)
+          | Structured -> (None, None, get_structured_proof document st (Some id)))
+        |> function Terminated(a,b,c) -> a,b,c | _ -> None,None,None
       in
       let messages, pp_messages =
-        match pp_mode with Pp -> (get_messages document id, []) | String -> ([], get_string_messages document id)
+        match pp_mode with
+        | Pp | Structured -> (get_messages document id, [])
+        | String -> ([], get_string_messages document id)
       in
       let range = Document.range_of_id document id in
-      let params = Notification.Server.ProofViewParams.{ proof; messages; pp_proof; pp_messages; range } in
+      let params = Notification.Server.ProofViewParams.{ proof; messages; pp_proof; pp_messages; struct_proof; struct_messages=messages; range } in
       let notification = Notification.Server.ProofView params in
       ([], make_handled_event ~state:st ~notification ~update_view:true ())
   | SendProofView _ ->
       let params =
         Notification.Server.ProofViewParams.
-          { proof = None; pp_proof = None; messages = []; pp_messages = []; range = Range.top () }
+          { proof = None; pp_proof = None; messages = []; pp_messages = []; struct_proof = None; struct_messages = []; range = Range.top () }
       in
       let notification = Notification.Server.ProofView params in
       ([], make_handled_event ~state:st ~notification ~update_view:true ())
